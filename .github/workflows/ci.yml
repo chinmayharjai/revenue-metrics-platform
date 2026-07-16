@@ -1,0 +1,275 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same PR. Pushing three commits in a minute should
+# not queue three full CI runs, and the first two results are worthless the moment
+# the third exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Jobs are split by what they need, not by what they check.
+  #
+  # lint, tests and dag-import need nothing but the repo, so they run on every PR
+  # including from forks. dbt-build needs Snowflake credentials, which forks cannot
+  # have. Fusing them into one job would mean a fork PR fails at the credential
+  # step and reports "CI failed" for code that is fine — so the checks that CAN run
+  # everywhere are kept in jobs that DO run everywhere.
+  # ---------------------------------------------------------------------------
+
+  lint:
+    name: sqlfluff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install sqlfluff
+        run: pip install sqlfluff==4.2.2
+
+      - name: Lint dbt models and tests
+        # The jinja templater with stubbed dbt_utils macros (sqlfluff_libs/), not the
+        # dbt templater. The dbt templater compiles by connecting to the warehouse,
+        # which would make "is this SQL syntactically valid?" depend on Snowflake
+        # being awake and on a fork having credentials. This catches syntax; the
+        # dbt-build job below catches everything else.
+        run: sqlfluff lint dbt_project/models dbt_project/tests --dialect snowflake
+
+      - name: Lint Snowflake setup scripts
+        # Reads snowflake_setup/.sqlfluff — uppercase DDL conventions, unlike the
+        # lowercase models. This lint has already earned its place: it caught
+        # CREATE RESOURCE MONITOR ... IF NOT EXISTS, which Snowflake rejects, before
+        # it ever reached an account.
+        run: sqlfluff lint snowflake_setup
+
+      - name: Lint SQL showcase
+        run: sqlfluff lint sql_showcase
+
+  tests:
+    name: pytest (simulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pandas==2.2.3 numpy==2.1.3 pytest==8.3.4
+
+      - name: Run simulator tests
+        # These assert the manifest tells the truth about the generated data. Every
+        # count quoted in the README and every "this test catches N bad rows" claim
+        # is anchored to _manifest.json, so this suite is what keeps those numbers
+        # from rotting.
+        run: pytest tests/ -v --tb=short
+
+      - name: Verify the committed manifest still matches a fresh generation
+        # The manifest in git is the evidence behind the README's numbers. If a
+        # change to the simulator moves those counts, the README is now wrong and
+        # this fails — rather than the numbers quietly drifting from the code.
+        run: |
+          python data_generator/simulate.py --out /tmp/ci_raw
+          python - <<'PY'
+          import json, sys
+
+          committed = json.load(open('data/raw/_manifest.json'))
+          fresh = json.load(open('/tmp/ci_raw/_manifest.json'))
+
+          drift = []
+          for table, count in committed['row_counts'].items():
+              if fresh['row_counts'][table] != count:
+                  drift.append(f"{table}: committed {count}, regenerated {fresh['row_counts'][table]}")
+
+          for name, spec in committed['injected_problems'].items():
+              key = 'count' if 'count' in spec else 'affected_rows'
+              if fresh['injected_problems'][name][key] != spec[key]:
+                  drift.append(f"{name}: committed {spec[key]}, regenerated {fresh['injected_problems'][name][key]}")
+
+          if drift:
+              print('Committed manifest no longer matches a fresh run:\n  ' + '\n  '.join(drift))
+              print('\nThe README quotes these numbers. Re-run the simulator, commit the')
+              print('manifest, and update the README, or revert the change to the generator.')
+              sys.exit(1)
+
+          print(f"Manifest matches: {committed['row_counts']['invoices']:,} invoice lines, "
+                f"{committed['injected_problems']['duplicate_invoice_lines']['count']:,} duplicates")
+          PY
+
+  dag-import:
+    name: Airflow DAG import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Airflow
+        # Pinned with the constraints file. Airflow has ~600 transitive dependencies
+        # and installing it unconstrained resolves to a combination nobody has ever
+        # tested — the constraints file is the only supported way to install it.
+        run: |
+          pip install "apache-airflow==2.10.3" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.3/constraints-3.11.txt"
+          pip install "apache-airflow-providers-slack==8.9.0"
+
+      - name: Import the DAG
+        # A DAG file is Python that Airflow imports at parse time. A typo, a bad
+        # import, or a cycle in the dependency graph is a *runtime* error the
+        # scheduler discovers at 03:00 and reports as "DAG not found". Importing it
+        # in CI turns that into a failed PR check.
+        #
+        # DagBag with include_examples=False parses the folder exactly as the
+        # scheduler does, then import_errors is asserted empty.
+        env:
+          AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+        run: |
+          python - <<'PY'
+          import sys
+          from airflow.models import DagBag
+
+          bag = DagBag(dag_folder='airflow/dags', include_examples=False)
+
+          if bag.import_errors:
+              for path, err in bag.import_errors.items():
+                  print(f"::error file={path}::{err}")
+              sys.exit(1)
+
+          if 'revenue_elt' not in bag.dags:
+              print(f"::error::revenue_elt not found. Loaded: {list(bag.dags)}")
+              sys.exit(1)
+
+          dag = bag.dags['revenue_elt']
+          print(f"revenue_elt imported cleanly: {len(dag.tasks)} tasks")
+
+          # The gate is the reason the test suite means anything. If someone
+          # loosens its trigger rule, a failed test would publish — so assert it
+          # here rather than trusting a code review to notice a one-word change.
+          gate = dag.get_task('publish_gate')
+          assert str(gate.trigger_rule) == 'all_success', \
+              f"publish_gate trigger_rule is {gate.trigger_rule}, must be all_success"
+
+          upstream = {t.task_id for t in gate.upstream_list}
+          assert any('dbt_test' in t for t in upstream), \
+              f"publish_gate must be downstream of dbt_test; upstream is {upstream}"
+
+          print("publish_gate: all_success, downstream of dbt_test")
+          PY
+
+  dbt-build:
+    name: dbt build (CI schema)
+    runs-on: ubuntu-latest
+    # Only runs where secrets exist. Fork PRs skip this job rather than failing it:
+    # GitHub does not expose secrets to forks, by design, and a red X on a
+    # contributor's first PR for a credential they were never going to have is a
+    # bad first experience and tells nobody anything.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+    environment: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dbt
+        run: pip install dbt-core==1.8.9 dbt-snowflake==1.8.4
+
+      - name: Check for Snowflake credentials
+        id: creds
+        # Secrets cannot be used in a job-level `if`, so the presence check happens
+        # here and later steps gate on its output. Without this, a repo with no
+        # Snowflake account (which is this repo's current state) reports a hard CI
+        # failure on every PR for a check it was never able to run — and a CI badge
+        # that is always red is a CI badge nobody reads.
+        run: |
+          if [ -n "${{ secrets.SNOWFLAKE_ACCOUNT }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Snowflake credentials configured — skipping dbt build."
+            echo "::notice::Add SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER and SNOWFLAKE_PRIVATE_KEY to the 'ci' environment to enable it."
+          fi
+
+      - name: Write private key
+        if: steps.creds.outputs.available == 'true'
+        # Key-pair auth. The key is written to a file because that is what the
+        # Snowflake connector wants, into RUNNER_TEMP (wiped with the runner) rather
+        # than the workspace (which later steps and any action could read).
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/keys/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/keys/rsa_key.p8"
+
+      - name: Materialize profiles.yml from the example
+        if: steps.creds.outputs.available == 'true'
+        # profiles.yml is gitignored (it is the file most likely to end up holding a
+        # literal credential). The example is committed, reads every value from the
+        # environment, and is copied into place here — so CI uses the same profile
+        # definition a developer would, rather than a second copy maintained in this
+        # workflow that could drift from it.
+        run: cp dbt_project/profiles.yml.example dbt_project/profiles.yml
+
+      - name: dbt deps
+        if: steps.creds.outputs.available == 'true'
+        working-directory: dbt_project
+        run: dbt deps
+
+      - name: dbt build against a per-run CI schema
+        if: steps.creds.outputs.available == 'true'
+        working-directory: dbt_project
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/dbt_project
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/keys/rsa_key.p8
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        # --target ci resolves the schema to CI_<run_id> (see profiles.yml.example),
+        # so concurrent PRs cannot overwrite each other's models. `dbt build` is
+        # correct *here*, unlike in the DAG: CI wants to stop at the first failure
+        # and report it, whereas production wants every model built and consistent
+        # before the gate decides.
+        run: dbt build --target ci
+
+      - name: Drop the CI schema
+        # if: always() — the schema must be dropped even when the build fails, which
+        # is exactly when it is most likely to be left behind. Without this every
+        # failed PR leaks a schema and the account fills with CI_1234567890 forever.
+        if: always() && steps.creds.outputs.available == 'true'
+        working-directory: dbt_project
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/dbt_project
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/keys/rsa_key.p8
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          dbt run-operation drop_ci_schema --target ci --args "{schema_suffix: ${{ github.run_id }}}" || true
