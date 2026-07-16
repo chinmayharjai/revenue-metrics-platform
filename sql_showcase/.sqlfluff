@@ -1,0 +1,34 @@
+# These are hand-written analytical queries meant to be read, run in a worksheet,
+# and screenshotted — not dbt models. They follow the same convention as
+# snowflake_setup/ (uppercase keywords, lowercase columns) because that is what a
+# Snowflake worksheet and its result grid look like.
+
+[sqlfluff]
+dialect = snowflake
+max_line_length = 120
+
+# RF05 is excluded for one specific reason: the waterfall query aliases its output
+# columns "+ new", "- churn" and so on. Those characters are the point — the result
+# grid is meant to read as a waterfall when screenshotted, and a column called
+# new_mrr does not. Quoted identifiers are valid Snowflake; RF05 guards against
+# *accidental* special characters, and these are deliberate.
+#
+# LT01/LT02/CP02 are excluded for the same reasons as snowflake_setup/.sqlfluff:
+# indented option blocks read better than sqlfluff's flattening, and these files
+# mix uppercase object names with lowercase column names on purpose.
+exclude_rules = RF04, ST06, AM04, RF02, RF01, CV02, ST05, LT05, LT09, LT12, RF03, AL05, ST03, CP03, AL03, AM06, LT11, LT01, LT02, CP02, RF05
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = upper
