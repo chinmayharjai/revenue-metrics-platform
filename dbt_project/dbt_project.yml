@@ -1,0 +1,77 @@
+name: revenue_metrics
+version: '1.0.0'
+config-version: 2
+
+profile: revenue_metrics
+
+model-paths: ['models']
+test-paths: ['tests']
+macro-paths: ['macros']
+seed-paths: ['seeds']
+
+target-path: 'target'
+clean-targets: ['target', 'dbt_packages']
+
+require-dbt-version: ['>=1.8.0', '<2.0.0']
+
+vars:
+  # The simulator's window. Pinned rather than derived from CURRENT_DATE so the
+  # marts don't quietly change shape as the wall clock moves past the data.
+  reporting_start_date: '2024-07-01'
+  reporting_end_date: '2026-06-30'
+
+  # A day-over-day ARR move larger than this fails the build (see
+  # tests/assert_arr_day_over_day_tolerance.sql). 10% is not a statistical
+  # threshold — it is "no legitimate overnight change to a 24-month book is this
+  # big, so something upstream broke".
+  arr_tolerance_pct: 10
+
+  # billing_sync_v2 writes IST wall-clock into a column its contract calls UTC.
+  # Correcting it needs the offset in exactly one place.
+  broken_tz_source: 'billing_sync_v2'
+  broken_tz_offset_hours: -5.5
+
+models:
+  revenue_metrics:
+    +on_schema_change: append_new_columns
+
+    staging:
+      +database: REVENUE_STAGING
+      +schema: STAGING
+      # Views, not tables. Staging is thin (rename, cast, dedup) and rebuilding
+      # it costs nothing — materializing it would pay storage to cache a query
+      # that Snowflake's result cache already handles. The one exception is
+      # stg_invoices, overridden in the model itself.
+      +materialized: view
+
+    intermediate:
+      +database: REVENUE_STAGING
+      +schema: INTERMEDIATE
+      +materialized: ephemeral
+      # Ephemeral by default: these models exist to name a step, not to be
+      # queried. Inlining them as CTEs keeps the intermediate layer from
+      # becoming a set of tables people build dashboards on — which is the same
+      # failure REPORTER's missing STAGING_READ grant prevents from the other
+      # direction. Models that are expensive enough to be worth persisting
+      # override this individually.
+
+    marts:
+      +database: REVENUE_ANALYTICS
+      +schema: MARTS
+      +materialized: table
+      # Tables. This is the published contract — it gets read by Power BI on
+      # every dashboard refresh and must not re-derive 500K rows each time.
+
+seeds:
+  revenue_metrics:
+    +database: REVENUE_ANALYTICS
+    +schema: MARTS
+
+tests:
+  revenue_metrics:
+    +store_failures: true
+    +schema: TEST_FAILURES
+    # Failures are written to a table rather than only counted. When a test
+    # fails at 03:00 the useful question is "which rows?", and re-running a
+    # failing test by hand to find out wastes the one thing an on-call has none
+    # of. runbooks/dag_failure_recovery.md (M8) points at these tables directly.

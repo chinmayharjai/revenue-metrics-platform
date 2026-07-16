@@ -166,7 +166,14 @@ GRANT USAGE ON WAREHOUSE WH_REPORTING TO ROLE REPORTER;
 
 USE ROLE ACCOUNTADMIN;
 
-CREATE RESOURCE MONITOR IF NOT EXISTS RM_REVENUE_PLATFORM WITH
+-- CREATE OR REPLACE, not IF NOT EXISTS: unlike almost every other object in
+-- Snowflake, CREATE RESOURCE MONITOR does not accept IF NOT EXISTS. (sqlfluff's
+-- snowflake dialect rejects it, which is how this was caught before it reached a
+-- real account.) The consequence is that re-running this file resets the
+-- monitor's used-credit counter for the current period, so the 50-credit ceiling
+-- starts over. Run 01 once at setup; if you re-run it later, comment this block
+-- out or expect the quota to reset.
+CREATE OR REPLACE RESOURCE MONITOR RM_REVENUE_PLATFORM WITH
     CREDIT_QUOTA = 50
     FREQUENCY = MONTHLY
     START_TIMESTAMP = IMMEDIATELY

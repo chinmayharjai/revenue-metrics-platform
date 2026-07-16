@@ -1,0 +1,140 @@
+version: 2
+
+models:
+
+  - name: int_month_spine
+    description: >
+      Every calendar month in the reporting window. A spine, not a derived set — if the
+      months came from `select distinct date_trunc('month', issued_at)`, a month with no
+      invoices would not exist, a churned customer would have no month to be zero in,
+      and churn would be invisible rather than wrong.
+    columns:
+      - name: month_start
+        tests: [not_null, unique]
+      - name: month_end
+        tests: [not_null]
+      - name: days_in_month
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 28
+              max_value: 31
+              inclusive: true
+
+  - name: int_invoice_lines_usd
+    description: >
+      Invoice lines converted to USD at the rate on their issued date (post-timezone-
+      correction). Translating at the transaction date rather than a current rate means
+      a closed month's revenue never moves again — which is the whole point.
+    columns:
+      - name: invoice_line_key
+        tests: [not_null, unique]
+      - name: amount_usd
+        description: NULL would mean a missing FX rate; asserted in tests/assert_usd_conversion_is_correct.sql with the diagnosis attached.
+        tests: [not_null]
+      - name: rate_to_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+
+  - name: int_subscription_spells
+    description: >
+      Spells enriched with contracted MRR (seats x plan list price per seat per month).
+
+      That definition is a decision, not a calculation: overage and seats_addon are
+      excluded (usage is not recurring — a customer who overran quota once has not
+      expanded their contract), discounts are excluded (this is list MRR), tax always.
+      Reasonable companies define it differently; the point is it is written once here
+      and everything downstream inherits it, rather than three teams each picking one.
+    columns:
+      - name: subscription_id
+        tests: [not_null, unique]
+      - name: mrr_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+      - name: spell_effective_end
+        description: ended_at coalesced to the window end, scoped to this column only so it cannot leak into a churn count.
+        tests: [not_null]
+      - name: spell_days
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+
+  - name: int_revenue_allocated_to_months
+    description: >
+      **The model the intermediate layer exists for.** Allocates each invoice line across
+      the calendar months its billing period covers, pro-rata by days.
+
+      Subscriptions bill on their anniversary, so a period runs 14 Mar -> 13 Apr: one
+      invoice, two calendar months (an annual contract spans thirteen). Finance reports
+      by calendar month, so `date_trunc('month', issued_at)` would dump the whole charge
+      into March, overstate it, leave a hole in April, and do so consistently enough to
+      look like seasonality rather than a bug.
+
+      Excludes tax (a liability, never revenue) and voided invoices; keeps 'open' ones —
+      unpaid is a collections problem, not a revenue-recognition one.
+    columns:
+      - name: allocated_amount_usd
+        tests: [not_null]
+      - name: allocation_fraction
+        description: Must sum to exactly 1.0 per invoice line — asserted in tests/assert_allocation_conserves_revenue.sql.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 1
+              inclusive: true
+      - name: overlap_days
+        description: Inclusive of both bounds. Dropping the +1 loses ~3% of revenue — small enough to look like rounding, large enough to matter at board level.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+      - name: month_start
+        tests:
+          - not_null
+          - relationships:
+              to: ref('int_month_spine')
+              field: month_start
+
+  - name: int_customer_months
+    description: >
+      The customer-month grain: one row per customer per month from signup to window end,
+      carrying MRR in force at month end. Rows continue after churn with mrr_usd = 0.
+
+      MRR at month end is the standard SaaS convention and a real trade-off: it ignores
+      intra-month movement, so a customer who churned on the 2nd and one who churned on
+      the 30th look identical. Time-weighting MRR instead would measure activity rather
+      than commitment and produce a number nobody can reconcile to a contract. Revenue
+      *recognition* is time-weighted — that is int_revenue_allocated_to_months' job. The
+      two answer different questions and the marts carry both.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [customer_id, month_start]
+          config:
+            severity: error
+            # The fan-out guard. A plan change on a month's final day leaves two spells
+            # overlapping month_end for an instant; without the row_number() in the
+            # model, the customer contributes MRR twice — a double-count that appears
+            # only on month boundaries, only for customers who changed plans that day.
+    columns:
+      - name: customer_id
+        tests: [not_null]
+      - name: month_start
+        tests: [not_null]
+      - name: mrr_usd
+        description: Coalesced to 0, not NULL. A churned customer's MRR is a known zero; NULL would drop the row from SUMs and from the lag() comparison, and churn would stop being detected.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+      - name: is_active
+        tests: [not_null]

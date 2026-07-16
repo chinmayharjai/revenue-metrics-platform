@@ -1,0 +1,53 @@
+# Nested config: these scripts follow a different convention to the dbt models,
+# and that is deliberate rather than an oversight.
+#
+# The dbt models are lowercase (the dbt house style, and what every dbt example
+# in the wild looks like). Admin DDL is uppercase, because Snowflake stores
+# unquoted identifiers uppercase and every SHOW GRANTS / INFORMATION_SCHEMA
+# result comes back uppercase — writing the DDL any other way means the script
+# and the audit output of that script do not look like each other.
+#
+# sqlfluff reads the nearest .sqlfluff walking up from each file, so this
+# overrides the root config for this directory only.
+
+[sqlfluff]
+dialect = snowflake
+max_line_length = 120
+
+# No templater override here. `templater = raw` would suit these files (there is no
+# jinja in them) but sqlfluff only honours the templater setting from the config in
+# the working directory, not a nested one — setting it here emits a warning on every
+# run and changes nothing. The root config's jinja templater is harmless on files
+# that contain no jinja.
+
+# LT01/LT02 (whitespace and indentation) are excluded here but enforced on the dbt
+# models. Admin DDL is written as indented option blocks under CREATE ... WITH,
+# which reads well and is how Snowflake's own docs present it; sqlfluff's layout
+# rules flatten every option to column 0. For files whose main job is to be read
+# by a human deciding whether to trust a grant, legibility wins over the rule.
+#
+# AL03/AM06/LT11 are excluded because they target analytical SELECTs and misfire
+# on DDL and on the verification queries at the foot of each file.
+#
+# CP02 (identifier case) is excluded because these files deliberately mix cases:
+# databases, schemas, roles and warehouses are UPPERCASE (matching what Snowflake
+# stores and what SHOW GRANTS returns), while column names in the raw DDL are
+# lowercase (matching the source CSV headers and the dbt models that read them).
+# Both conventions are right for their half of the file and no single CP02 policy
+# accepts both. Keyword casing is still enforced via CP01.
+exclude_rules = RF04, ST06, AM04, RF02, RF01, CV02, ST05, LT05, LT09, LT12, RF03, AL05, ST03, CP03, AL03, AM06, LT11, LT01, LT02, CP02
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = upper

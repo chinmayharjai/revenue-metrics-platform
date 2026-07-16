@@ -1,0 +1,58 @@
+# Copy to ~/.dbt/profiles.yml. Do NOT commit the filled-in version —
+# profiles.yml is in .gitignore for this reason.
+#
+# Every value is read from the environment. Nothing here should ever be a
+# literal: this file is the one most likely to be pasted into a Slack thread
+# while debugging a connection.
+
+revenue_metrics:
+  target: dev
+
+  outputs:
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+
+      # Key-pair auth, not a password. This is an unattended service account, and
+      # a password on a service account is a password that ends up in a CI log.
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE') }}"
+
+      role: TRANSFORMER
+      warehouse: WH_TRANSFORMING
+      database: REVENUE_STAGING
+      schema: STAGING
+      threads: 8
+      client_session_keep_alive: false
+      query_tag: dbt-dev
+
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE') }}"
+      role: TRANSFORMER
+      warehouse: WH_TRANSFORMING
+      database: REVENUE_STAGING
+
+      # Per-PR schema so concurrent CI runs cannot overwrite each other's models.
+      # GITHUB_RUN_ID is unique per run; the default keeps local `--target ci`
+      # working without inventing an ID.
+      schema: "CI_{{ env_var('GITHUB_RUN_ID', 'local') }}"
+      threads: 4
+      query_tag: dbt-ci
+
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE') }}"
+      role: TRANSFORMER
+      warehouse: WH_TRANSFORMING
+      database: REVENUE_STAGING
+      schema: STAGING
+      threads: 8
+      query_tag: dbt-prod

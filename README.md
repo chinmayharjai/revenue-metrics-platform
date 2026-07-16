@@ -11,7 +11,7 @@ architecture diagram, results table and how-to-run land in M8.
 |---|-----------|--------|
 | M1 | Data simulator | ✅ |
 | M2 | Snowflake setup (RBAC, schemas, COPY INTO) | ✅ |
-| M3 | dbt project (staging → intermediate → marts) | ⬜ |
+| M3 | dbt project (staging → intermediate → marts) | ✅ |
 | M4 | Expert SQL showcase | ⬜ |
 | M5 | Airflow orchestration | ⬜ |
 | M6 | CI/CD | ⬜ |
@@ -174,3 +174,153 @@ trivially idempotent. Incremental loading here would optimise the cheapest step 
 pipeline while introducing the one bug class this dataset is built to expose — did the
 watermark advance past a late arrival? The 7,569 late-arriving lines get handled in dbt
 with a trailing window, where it's testable.
+
+---
+
+## M3 — dbt project
+
+> **Not yet executed against Snowflake** (no account attached), so no row counts or
+> runtimes from the warehouse are claimed here. What *has* been verified locally, and
+> runs in CI from M6: every model and test templates and parses cleanly against the
+> Snowflake dialect via `sqlfluff lint` (0 parse errors, 0 rule violations). That
+> catches syntax, not semantics — `dbt build` is what proves the logic, and it needs a
+> warehouse.
+
+```
+dbt_project/models/
+├── staging/          6 models — clean, rename, cast, dedup, correct
+├── intermediate/     5 models — spells, currency, allocation, customer-months
+└── marts/            5 models — fct_revenue, fct_arr_snapshot, dim_customer/product/date
+```
+
+```bash
+cd dbt_project
+cp profiles.yml.example ~/.dbt/profiles.yml   # every value reads from env vars
+dbt deps && dbt build && dbt docs generate
+```
+
+### The star schema
+
+`fct_revenue` is the published contract — grain: **one row per customer per calendar
+month**, from signup to the window end. It carries two different kinds of money, and
+conflating them is the single most likely misuse of the table:
+
+| | `mrr_usd` / `arr_usd` | `recognized_revenue_usd` |
+|---|---|---|
+| **Is** | Contracted run-rate at month end | Revenue earned in the month |
+| **Answers** | "What are we owed per month if nothing changes?" | "What did we actually earn in March?" |
+| **From** | subscriptions | invoices, allocated pro-rata |
+| **Kind** | a commitment (snapshot) | an earning (time-weighted) |
+
+**They do not tie out, and shouldn't.** An annual customer commits 12× their MRR but is
+invoiced once; a customer who churns mid-month has zero closing MRR and a fortnight of
+recognized revenue. Reports that add them together, or use one to check the other, are
+wrong — so both the model and the schema docs say so out loud.
+
+### The three decisions that carry the project
+
+**Allocation, not `date_trunc`.** Anniversary billing means a period runs 14 Mar → 13
+Apr: one invoice, two calendar months (an annual contract spans thirteen).
+`int_revenue_allocated_to_months` spreads each line across the months it actually pays
+for, pro-rata by days. `date_trunc('month', issued_at)` would dump the whole charge into
+March, overstate it, leave a hole in April — and do it consistently enough to look like
+seasonality rather than a bug. `assert_allocation_conserves_revenue.sql` pins the
+invariant: for every line, the slices must sum back to the amount **and** the fractions
+must sum to exactly 1.0. The second half is the stronger one — a period partly outside
+the month spine would allocate 95% of itself and still look internally consistent if
+only the amount were checked.
+
+**A spine, not an aggregation.** `int_month_spine` and `int_customer_months` enumerate
+every customer-month and let MRR be zero, rather than aggregating the months that happen
+to appear in the data. Churn is not an event here — no source table has a "churned" row
+to count. Churn is the *absence* of MRR in a month that followed MRR, and you cannot
+detect an absence in a dataset containing only presences. Give a churned customer no
+April row and April's churn is zero forever, and every test still passes.
+
+**MRR is defined once.** `seats × plan list price`. Overage and add-ons excluded (usage
+isn't recurring — a customer who overran quota once hasn't expanded their contract),
+discounts excluded (this is *list* MRR), tax excluded everywhere always. Reasonable
+companies define it differently; the point is that it's written down in one model and
+everything inherits it, rather than three teams each picking one — which is the premise
+of the whole repo.
+
+### Tests — 163 of them
+
+| Kind | Count |
+|---|---:|
+| `not_null` | 37 |
+| `dbt_utils.accepted_range` | 19 |
+| `relationships` (referential integrity) | 13 |
+| `accepted_values` | 13 |
+| `unique` / `unique_combination_of_columns` (grain) | 5 + inline |
+| Custom singular tests | 9 |
+| **Total** | **163** |
+
+Counted from the YAML and `tests/`, not estimated. The nine custom ones are where the
+real thinking is:
+
+- **`assert_raw_staging_row_reconciliation`** — the naive `count(raw) = count(staging)`
+  would fail every run (staging legitimately drops 10,011 replays), get marked
+  `severity: warn`, and never be read again. This asserts the arithmetic instead:
+  `raw − duplicates_removed = staging`. If dedup ever drops a *real* line, this fails
+  even though the count looks plausible.
+- **`assert_mrr_waterfall_reconciles`** — `prior + new + reactivation + expansion +
+  contraction + churn == mrr`, per customer-month. **This is the test that catches a
+  double-count.** A fan-out gives one customer two rows and every column still looks
+  reasonable — MRR positive, categories valid, nothing null — the total is just too big.
+  No single-column test finds that. Only the identity does.
+- **`assert_allocation_conserves_revenue`** — described above.
+- **`assert_timezone_correction_applied`** — pins that the fix hit *exactly* the 40,965
+  broken rows and no others. A correction applied to the wrong set would move 460K good
+  rows by 5h30m and look, on any summary query, like it had worked.
+- **`assert_usd_conversion_is_correct`** — three checks whose combination matters: USD
+  converts to itself (a control — if the divide were a multiply, USD still passes and
+  every US spot-check looks clean while JPY is off by 151×), no conversion produced
+  NULL, and non-USD amounts actually changed.
+- **`assert_arr_run_over_run_tolerance`** — see below.
+- Plus grain, org-hierarchy traversability (one root, no cycles, depth within what
+  `dim_customer` flattens), and credit-line signs.
+
+### The ARR tolerance test is not month-over-month
+
+The PRD asked for a day-over-day ARR tolerance. Implemented as **run-over-run** instead,
+backed by `fct_arr_snapshot` (append-only, one row per dbt run per month), because the
+obvious readings are both broken:
+
+- *This month vs last month* fails on legitimate growth — a book ramping from zero moves
+  >10% month-over-month for real, so the test either cries wolf or is set so loose it
+  catches nothing.
+- *Versus a hardcoded expected number* rots the first time the data legitimately changes,
+  and someone edits the constant to make CI green without reading why it moved.
+
+What actually matters is different: **a closed month's ARR changed between two runs.**
+March 2025 is a fact. If today's run disagrees with yesterday's about it, a code change
+moved a closed month — the exact failure this platform exists to prevent, and invisible
+to any test that only looks at one run. The threshold (10%, in `dbt_project.yml`) isn't
+statistical; it's "no legitimate overnight change to a 24-month book is this big".
+
+Honest gap: the test passes vacuously on the first run and after a `--full-refresh` of
+the snapshot, which wipes the history. That's why full-refreshing that model is called
+out as a deliberate act in the runbook rather than something to try when a run looks
+stuck.
+
+### Materialization, and where the severity calls are
+
+Staging is views (thin work, rebuilt free) except `stg_invoices`, which is a table — it's
+the only staging model doing real work (a window function over 511K rows) and every
+downstream model reads it, so as a view the dedup would re-execute on every reference.
+Intermediate is **ephemeral by default**, so the layer names steps without becoming
+tables people build dashboards on — the same failure `REPORTER`'s missing `STAGING_READ`
+grant prevents from the other direction. Two intermediate models override that where the
+fan-out is expensive enough to persist. Marts are tables.
+
+`store_failures: true` globally: when a test fails at 03:00 the useful question is
+"which rows?", and re-running a failing test by hand to find out wastes the one thing an
+on-call has none of.
+
+The most arguable line in the project is the `relationships` severity on
+`stg_invoices.subscription_id`. The 500 orphans are late-arriving parents, not
+corruption — the invoice is real, its subscription just hasn't landed. Erroring would
+mean a source-side timing quirk stops ARR from publishing; dropping them silently would
+understate revenue with no trace. So: `warn`, with `error_if: ">550"` — above that it
+stops being lateness and becomes a broken extract.

@@ -1,0 +1,73 @@
+[sqlfluff]
+dialect = snowflake
+templater = jinja
+max_line_length = 120
+exclude_rules = RF04, ST06, AM04, RF02, RF01, CV02, ST05, LT05, LT09, LT12, RF03, AL05, ST03, CP03
+
+# Why the jinja templater rather than the dbt one:
+#
+# The dbt templater compiles models by connecting to the warehouse, which means
+# linting would require Snowflake credentials. That is the wrong dependency for a
+# lint job — it would make CI unable to check SQL syntax on a PR from a fork, and
+# it would make "is this SQL valid?" contingent on whether a warehouse is awake.
+#
+# The jinja templater instead renders the templates with stubbed macros
+# (sqlfluff_libs/) and parses the result. It cannot resolve real ref() lineage, so
+# it will not catch a typo'd model name — that is `dbt build`'s job in CI, and the
+# two checks are complementary rather than redundant.
+
+[sqlfluff:templater:jinja]
+apply_dbt_builtins = True
+library_path = sqlfluff_libs
+
+[sqlfluff:templater:jinja:context]
+# Mirrors dbt_project.yml vars. Kept in sync by hand; a drift here only affects
+# linting, never the built models.
+reporting_start_date = 2024-07-01
+reporting_end_date = 2026-06-30
+arr_tolerance_pct = 10
+broken_tz_source = billing_sync_v2
+broken_tz_offset_hours = -5.5
+
+# dbt runtime builtins that sqlfluff does not stub. Real values are injected by
+# dbt at run time; these placeholders exist only so the template renders and the
+# SQL underneath can be parsed.
+invocation_id = lint-invocation-id
+run_started_at = 2024-07-01 00:00:00
+
+[sqlfluff:indentation]
+indented_joins = False
+indented_ctes = False
+template_blocks_indent = False
+
+# Single space before `as`, not aligned. Alignment was tried and reverted: in a
+# select list containing one long expression, aligning pads every other alias out
+# to match it, so a single wide CASE drags the whole block into a column of
+# whitespace. Single spacing is stable under edits — adding a long line does not
+# reformat its neighbours — and it is what the dbt style guide assumes.
+[sqlfluff:layout:type:alias_expression]
+spacing_before = single
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+[sqlfluff:rules:ambiguous.column_references]
+group_by_and_order_by_style = implicit
