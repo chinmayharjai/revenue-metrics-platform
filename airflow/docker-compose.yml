@@ -1,0 +1,163 @@
+# Local Airflow for developing and demoing the revenue ELT DAG.
+#
+# LocalExecutor with a single Postgres, not CeleryExecutor with Redis and workers.
+# The Celery setup is what a production deployment looks like, and reproducing it
+# here would add three containers to run one DAG whose tasks are all `dbt` shelling
+# out to a warehouse. The compute is in Snowflake; the scheduler is a job runner.
+# LocalExecutor is honest about that and starts in a fraction of the time.
+#
+# Prereq:  echo -e "AIRFLOW_UID=$(id -u)" > .env      (Linux/macOS; skip on Windows)
+# Start:   docker compose up -d
+# UI:      http://localhost:8080   (credentials from the env vars below)
+# Stop:    docker compose down          (keeps the metadata DB)
+#          docker compose down -v       (wipes it — including connections)
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+
+    # Fail fast on a broken DAG file rather than importing a partial graph.
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: '60'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
+
+    # SLA misses are logged and callback-able; without this the sla= arguments on
+    # tasks are silently inert, which is worse than not setting them at all
+    # because the DAG then *looks* like it has SLAs.
+    AIRFLOW__CORE__CHECK_SLAS: 'true'
+
+    DBT_PROJECT_DIR: /opt/airflow/dbt_project
+    DBT_PROFILES_DIR: /opt/airflow/.dbt
+    REVENUE_DATA_DIR: /opt/airflow/data
+
+    # Credentials are read from the host environment and never written into this
+    # file. The `:-` defaults keep `docker compose up` working for someone who
+    # just wants to look at the DAG graph without a Snowflake account — the DAG
+    # will fail at the first task that needs a warehouse, which is the correct
+    # and obvious behaviour.
+    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT:-}
+    SNOWFLAKE_USER: ${SNOWFLAKE_USER:-}
+    SNOWFLAKE_PRIVATE_KEY_PATH: ${SNOWFLAKE_PRIVATE_KEY_PATH:-}
+    SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${SNOWFLAKE_PRIVATE_KEY_PASSPHRASE:-}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      dbt-core==1.8.9
+      dbt-snowflake==1.8.4
+      apache-airflow-providers-slack==8.9.0
+      pandas==2.2.3
+      numpy==2.1.3
+    # _PIP_ADDITIONAL_REQUIREMENTS installs at container start, which is slow and
+    # re-runs on every boot. It is used here because it keeps this file
+    # self-contained and readable, which is the point of a demo compose file. A
+    # real deployment builds an image with these baked in — the runtime install is
+    # a startup-time dependency on PyPI being up, which is not something a
+    # production scheduler should have.
+
+  volumes:
+    - ../dbt_project:/opt/airflow/dbt_project
+    - ../snowflake_setup:/opt/airflow/snowflake_setup
+    - ../data_generator:/opt/airflow/data_generator
+    - ../data:/opt/airflow/data
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    # dbt_project and snowflake_setup are mounted rather than copied so the DAG
+    # runs the same SQL the repo contains. The load task executes
+    # snowflake_setup/03_copy_into.sql directly — the file a human runs by hand.
+    # A copy would drift, and the tested version would stop being the version that
+    # runs at 03:00.
+  user: '${AIRFLOW_UID:-50000}:0'
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'airflow']
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    # Local metadata DB only — throwaway credentials for a container that binds no
+    # host port. Nothing in Snowflake is reachable with these.
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-airflow}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}" \
+          --firstname Data --lastname Platform --role Admin \
+          --email admin@example.com || true
+
+        # Connections are created here rather than clicked into the UI, so a fresh
+        # `docker compose down -v && up` gives a working environment with no manual
+        # steps. The webhook URL comes from the host env — a real one must never be
+        # committed, and a Slack webhook is a bearer credential: anyone holding it
+        # can post to the channel.
+        airflow connections delete slack_alerts || true
+        airflow connections add slack_alerts \
+          --conn-type slackwebhook \
+          --conn-password "${SLACK_WEBHOOK_URL:-https://hooks.slack.example/unset}" || true
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: '0:0'
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', 'http://localhost:8974/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - '8080:8080'
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', 'http://localhost:8080/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
