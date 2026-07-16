@@ -10,7 +10,7 @@ architecture diagram, results table and how-to-run land in M8.
 | # | Milestone | Status |
 |---|-----------|--------|
 | M1 | Data simulator | ✅ |
-| M2 | Snowflake setup (RBAC, schemas, COPY INTO) | ⬜ |
+| M2 | Snowflake setup (RBAC, schemas, COPY INTO) | ✅ |
 | M3 | dbt project (staging → intermediate → marts) | ⬜ |
 | M4 | Expert SQL showcase | ⬜ |
 | M5 | Airflow orchestration | ⬜ |
@@ -99,3 +99,78 @@ and no cycles (a cycle would hang the recursive CTE in M4), that subscription sp
 don't overlap per customer (overlap would double-count MRR), that every movement type
 and churn actually occur, that FX covers every currency in the book, and that generation
 is deterministic for a given seed — without which the measured numbers above rot.
+
+---
+
+## M2 — Snowflake setup
+
+> **Not yet executed.** These scripts are written against Snowflake but have not been
+> run — this repo has no Snowflake account attached. Nothing in this section is
+> presented as a measured result. To verify: open a trial, run the three files in
+> order, and the verification queries at the foot of each will tell you whether the
+> claims hold. Where a number appears below it comes from `_manifest.json`, which is
+> measured locally.
+
+```
+snowflake_setup/
+├── 01_rbac_roles.sql      # roles, grants between them, warehouses, resource monitor
+├── 02_schema_design.sql   # databases, schemas, raw DDL, object grants
+└── 03_copy_into.sql       # file format, stage, loads, verification
+```
+Run in numeric order. `01` needs `USERADMIN`/`SYSADMIN`/`ACCOUNTADMIN`, `02` needs
+`SYSADMIN`/`SECURITYADMIN`, `03` runs as `LOADER`.
+
+### RBAC: two tiers, not three roles
+
+Access roles hold privileges on objects (`RAW_READ` can `SELECT` from raw). Functional
+roles hold job descriptions (`TRANSFORMER` is what dbt runs as). Functional roles are
+granted access roles; users are granted functional roles.
+
+The tiers exist because the privilege set and the job description change for different
+reasons. Adding a database touches access roles only; hiring an analyst touches
+functional roles only. Collapse them and every new database re-opens "who should see
+this?" in three places at once.
+
+| Role | Has | Deliberately does **not** have | Why |
+|---|---|---|---|
+| `LOADER` | `RAW_WRITE` (`INSERT`, `TRUNCATE`) | `RAW_READ`, `UPDATE`, `DELETE` | A loader that can't read back what it wrote isn't an exfiltration path if its key leaks. No `UPDATE` means it can't quietly "fix" a source value — which would destroy raw's only guarantee: that it is what the source sent. |
+| `TRANSFORMER` | `RAW_READ`, staging + analytics read/write | `RAW_WRITE` | dbt must never alter its own source of truth. If a model could write back to raw, the raw-vs-staging reconciliation test in M3 would be checking dbt against itself and be worth nothing. |
+| `REPORTER` | `ANALYTICS_READ`, `USAGE` on `WH_REPORTING` | `STAGING_READ`, `RAW_READ`, `OPERATE` | **This grant is the product.** If analysts can reach staging, someone builds a dashboard on an intermediate model, and there are three ARR numbers again — the exact problem this platform exists to solve. No `OPERATE` means nobody can `ALTER` the warehouse to a 4XL to make their query faster; cost control belongs in the grant, not a Slack reminder. |
+
+Three XS warehouses, one per function — per-function cost attribution, and a backfill
+can't queue behind a dashboard refresh. All XS deliberately: this is 500K rows, and
+resizing to fix a slow query is the expensive way to avoid reading the query profile
+(M4 makes that argument with an actual profile).
+
+### Three databases, not one with three schemas
+
+Costs some ceremony, buys a blast radius (`DROP DATABASE REVENUE_STAGING` can't take
+the marts with it) and a grant boundary that's hard to fumble — `REPORTER` simply isn't
+wired to the other two, so there's no per-schema exception to forget. Time Travel
+retention is set per layer by what a mistake costs: raw 7d (re-landing 24 months is an
+afternoon), staging 1d (a `dbt build` rebuilds it — paying to time-travel a derived
+table is paying twice), analytics 30d (someone *will* ask what the dashboard said on
+the 3rd, before the restatement).
+
+### Two decisions worth calling out
+
+**`issued_at` is `TIMESTAMP_NTZ`, not `TIMESTAMP_TZ`.** The source contract documents it
+as UTC; `billing_sync_v2` actually writes IST wall-clock into it. Typing it `TZ` forces a
+zone at load time — either believing the contract and baking the 5h30m error into raw
+permanently where it can't be told apart from a real timestamp, or guessing per row.
+`NTZ` stores exactly the wall-clock the source sent and defers the question to
+`stg_invoices`, where the correction is a visible, testable, revertable line of SQL
+rather than an assumption frozen into DDL.
+
+**Raw has no constraints and `ON_ERROR = ABORT_STATEMENT`.** Not a contradiction: the
+injected defects are *well-formed CSV rows containing bad data*, which `COPY` has no
+opinion about, so they land and M3's tests can count them. `ABORT_STATEMENT` catches
+malformed *files* — wrong column count, broken quote — which is a different failure and
+always operator error. `ON_ERROR = CONTINUE` would load 90% of a broken file, go green,
+and surface an hour later as a reconciliation failure pointing at dbt.
+
+Loads are `TRUNCATE` + `COPY` (full refresh). At 511K rows that's seconds on an XS and
+trivially idempotent. Incremental loading here would optimise the cheapest step in the
+pipeline while introducing the one bug class this dataset is built to expose — did the
+watermark advance past a late arrival? The 7,569 late-arriving lines get handled in dbt
+with a trailing window, where it's testable.
