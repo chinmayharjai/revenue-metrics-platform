@@ -1,0 +1,37 @@
+# Generated data — regenerate with `python data_generator/simulate.py`
+data/
+*.csv
+*.csv.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# dbt
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+.user.yml
+
+# Credentials — never commit. Use env vars.
+profiles.yml
+.env
+*.pem
+*.key
+secrets.toml
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+standalone_admin_password.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
