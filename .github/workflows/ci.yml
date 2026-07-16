@@ -64,6 +64,9 @@ jobs:
       - name: Lint SQL showcase
         run: sqlfluff lint sql_showcase
 
+      - name: Lint Cortex AI SQL
+        run: sqlfluff lint cortex_ai
+
   tests:
     name: pytest (simulator)
     runs-on: ubuntu-latest
