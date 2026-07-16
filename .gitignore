@@ -3,6 +3,10 @@ data/
 *.csv
 *.csv.gz
 
+# ...but keep the manifest. It is the evidence behind every count quoted in the
+# README and the dbt tests, and it is small. Regenerated on each simulator run.
+!data/raw/_manifest.json
+
 # Python
 __pycache__/
 *.py[cod]

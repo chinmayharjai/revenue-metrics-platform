@@ -1,0 +1,66 @@
+{
+  "generated_at_utc": "2026-07-16T11:38:16Z",
+  "seed": 42,
+  "window": {
+    "start": "2024-07-01",
+    "end": "2026-06-30",
+    "months": 24
+  },
+  "row_counts": {
+    "customers": 10000,
+    "employees": 123,
+    "plans": 8,
+    "subscriptions": 47552,
+    "invoices": 511089,
+    "fx_rates": 5840
+  },
+  "invoice_headers": 114985,
+  "note": "Counts are measured on the emitted files. 'rate' is the injection knob applied at its natural grain, which is not always the grain of the file: invoice defects are injected per header and fan out across that invoice's line items, so count/rows does not equal rate.",
+  "injected_problems": {
+    "duplicate_invoice_lines": {
+      "count": 10011,
+      "rate": 0.02,
+      "grain": "line",
+      "detail": "Billing batch replay: line re-emitted verbatim, later ingested_at. Dedup on (invoice_id, line_number) keeping max(ingested_at). A naive SELECT DISTINCT will not remove these -- ingested_at differs."
+    },
+    "orphan_invoice_lines": {
+      "count": 500,
+      "rate": 0.001,
+      "grain": "line",
+      "detail": "Invoice references a subscription_id absent from subscriptions.csv. Caught by the dbt relationships test on stg_invoices."
+    },
+    "late_arriving_invoices": {
+      "count": 7569,
+      "rate": 0.015,
+      "grain": "header, fanned out to lines",
+      "threshold_days": 3,
+      "detail": "ingested_at is 3-30 days after issued_at, i.e. lands after its calendar month closed. Counted as lines whose ingest lag exceeds 3 days. Forces incremental models to reprocess a trailing window rather than only the current month."
+    },
+    "timezone_bug": {
+      "source_system": "billing_sync_v2",
+      "affected_rows": 40965,
+      "day_boundary_crossings": 9352,
+      "month_boundary_crossings": 434,
+      "grain": "header, fanned out to lines",
+      "detail": "billing_sync_v2 writes IST wall-clock (UTC+5:30) into issued_at, a column its contract documents as UTC. Rows near midnight roll to the next day; rows on a month's last evening roll into the next month and misstate a closed month's revenue. Only the month crossings move money between reporting periods -- that is the number worth quoting."
+    },
+    "null_employee_count": {
+      "count": 1277,
+      "rate": 0.12,
+      "grain": "customer",
+      "detail": "Optional CRM field left blank."
+    },
+    "null_industry": {
+      "count": 661,
+      "rate": 0.07,
+      "grain": "customer",
+      "detail": "Optional CRM field left blank."
+    },
+    "null_payment_method": {
+      "count": 25822,
+      "rate": 0.05,
+      "grain": "header, fanned out to lines",
+      "detail": "Missing on a slice of invoices; affects every line of those invoices."
+    }
+  }
+}
