@@ -1,0 +1,11 @@
+# Macro files are Jinja control flow that happens to emit SQL, not SQL. sqlfluff
+# parses them as SQL, so its layout rules flatten the {% if %} nesting that makes
+# a macro readable, and its capitalisation rules have opinions about identifiers
+# that only exist inside a template. Linting them costs legibility and catches
+# nothing — a broken macro fails `dbt build`, loudly, which is the check that
+# actually applies.
+dbt_project/macros/
+
+# dbt build artifacts.
+dbt_project/target/
+dbt_project/dbt_packages/
