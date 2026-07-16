@@ -1,0 +1,88 @@
+version: 2
+
+sources:
+  - name: billing
+    database: REVENUE_RAW
+    schema: BILLING
+    description: >
+      Billing system extracts, landed by COPY INTO (snowflake_setup/03_copy_into.sql).
+      Source fidelity is preserved here — defects included. Nothing in RAW is corrected
+      in place; corrections happen in staging where they are visible and testable.
+
+    # Freshness is measured on _loaded_at (when our pipeline landed it), not on the
+    # source's own ingested_at. The two answer different questions: ingested_at going
+    # stale means the source stopped sending; _loaded_at going stale means we stopped
+    # loading. Only the second is ours to fix at 03:00, and it is the one that should
+    # page someone.
+    loaded_at_field: _loaded_at
+    freshness:
+      warn_after: {count: 12, period: hour}
+      error_after: {count: 26, period: hour}
+      # 26h, not 24h: a daily load has to be allowed to be two hours late without
+      # waking anyone. A threshold that fires on every slightly-slow run is a
+      # threshold people learn to ignore.
+
+    tables:
+      - name: subscriptions
+        description: One row per subscription spell — a contiguous period on one plan at one seat count.
+        columns:
+          - name: subscription_id
+            description: Natural key. Unique in the source.
+          - name: ended_at
+            description: NULL means the spell is still open. Not a defect.
+          - name: change_reason
+            description: What opened this spell — new, upgrade, downgrade, seat_change, reactivation.
+
+      - name: invoices
+        description: >
+          One row per invoice line item. Contains three deliberate defects:
+          10,011 duplicate lines from batch replay, 40,965 rows with an IST timezone
+          shift from billing_sync_v2, and 500 orphans with a dangling subscription_id.
+          See data/raw/_manifest.json.
+        columns:
+          - name: invoice_id
+            description: NOT unique on its own — an invoice has multiple lines. Grain is (invoice_id, line_number).
+          - name: issued_at
+            description: >
+              TIMESTAMP_NTZ. Documented as UTC by the source contract, but billing_sync_v2
+              actually writes IST wall-clock. Corrected in stg_invoices, not here.
+          - name: ingested_at
+            description: Source-side ingestion time. 7,569 lines land 3-30 days after issued_at.
+          - name: amount_local
+            description: Negative for discount and proration_credit lines. Not a defect.
+
+      - name: plans
+        description: Product catalogue. 8 plans, 4 tiers, monthly/annual.
+
+  - name: crm
+    database: REVENUE_RAW
+    schema: CRM
+    description: CRM extracts — accounts and the sales org.
+    loaded_at_field: _loaded_at
+    freshness:
+      warn_after: {count: 24, period: hour}
+      error_after: {count: 48, period: hour}
+      # Looser than billing on purpose. Stale CRM data degrades an attribute on a
+      # dimension; stale billing data misstates revenue. The alert thresholds should
+      # reflect which one is worth waking up for.
+
+    tables:
+      - name: customers
+        description: One row per account. industry and employee_count are nullable by contract.
+      - name: employees
+        description: Sales org, self-referencing via manager_id. Exactly one root (manager_id IS NULL).
+
+  - name: reference
+    database: REVENUE_RAW
+    schema: REFERENCE
+    description: Reference feeds.
+    loaded_at_field: _loaded_at
+    freshness:
+      warn_after: {count: 24, period: hour}
+      error_after: {count: 72, period: hour}
+      # FX is the loosest: rates are only used to normalize historical amounts, and
+      # a stale rate does not corrupt a closed month.
+
+    tables:
+      - name: fx_rates
+        description: Daily rate-to-USD per currency. USD is 1.0 by definition.

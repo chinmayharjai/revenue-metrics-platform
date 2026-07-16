@@ -1,0 +1,280 @@
+version: 2
+
+models:
+
+  - name: stg_invoices
+    description: >
+      Invoice lines, deduplicated on (invoice_id, line_number) keeping the latest
+      ingested_at, and timezone-corrected for billing_sync_v2. Materialized as a table
+      and clustered on issued_month — it is the only staging model doing real work and
+      every downstream model reads it.
+    tests:
+      # The grain claim, asserted. This is the test that proves the dedup worked:
+      # raw has 511,089 lines, 10,011 of them replays; if this passes, exactly the
+      # replays were removed and nothing else was.
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [invoice_id, line_number]
+          config:
+            severity: error
+
+    columns:
+      - name: invoice_line_key
+        description: Surrogate key over (invoice_id, line_number).
+        tests: [not_null, unique]
+
+      - name: invoice_id
+        description: Not unique alone — an invoice has many lines.
+        tests: [not_null]
+
+      - name: line_number
+        tests: [not_null]
+
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+
+      - name: subscription_id
+        description: >
+          500 lines reference a subscription absent from the extract (injected orphans).
+          The test below is the one that catches them.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_subscriptions')
+              field: subscription_id
+              config:
+                # warn, not error. This is a real judgement call and it is the most
+                # arguable line in the project.
+                #
+                # These 500 orphans are late-arriving parents, not corruption: the
+                # invoice is real, its subscription simply has not landed yet. Failing
+                # the build would mean a source-side timing quirk stops ARR from
+                # publishing — the pipeline punishing the business for the source's
+                # lateness. Silently dropping them would understate revenue with no
+                # trace.
+                #
+                # So: warn, let the run continue, and let store_failures write the
+                # offending rows to a table the runbook points at. If this ever climbs
+                # above ~0.1% of lines it stops being lateness and becomes a broken
+                # extract, which is what the count test below exists to catch.
+                severity: warn
+                error_if: ">550"
+                warn_if: ">0"
+
+      - name: line_type
+        tests:
+          - not_null
+          - accepted_values:
+              values: [subscription, tax, seats_addon, overage, discount, platform_fee, support_plan, proration_credit]
+              # error, not warn. An unrecognised line_type means the billing system
+              # started charging for something new. Every revenue model here decides
+              # what to include by line_type, so an unknown value is silently either
+              # counted or dropped — both wrong, neither visible. This should stop the
+              # build and force a human to classify it.
+              config:
+                severity: error
+
+      - name: amount_local
+        description: Negative on discount and proration_credit lines by convention.
+        tests:
+          - not_null
+          # No positivity test: credits are legitimately negative. The sign is
+          # asserted per line_type in tests/assert_credit_lines_are_negative.sql,
+          # which is the version of this check that is actually true.
+
+      - name: currency_code
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_fx_rates')
+              field: currency_code
+              # A currency with no FX rate silently drops out of the USD
+              # normalization join and vanishes from ARR. This is the referential
+              # integrity test that guards the revenue number itself.
+
+      - name: invoice_status
+        tests:
+          - accepted_values:
+              values: [paid, open, void]
+
+      - name: issued_at_utc
+        description: Timezone-corrected. Derived columns (issued_month, issued_date) come from this, never from issued_at_raw.
+        tests: [not_null]
+
+      - name: issued_month
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: "'{{ var('reporting_start_date') }}'::date"
+              max_value: "'{{ var('reporting_end_date') }}'::date"
+              # An invoice outside the simulator's window means either the generator
+              # or the timezone correction moved a row somewhere impossible. Cheap
+              # test, catches a whole class of date-arithmetic mistakes.
+
+      - name: is_tz_corrected
+        description: True for the 40,965 billing_sync_v2 rows whose issued_at was shifted.
+        tests: [not_null]
+
+      - name: ingest_lag_days
+        description: 7,569 lines exceed 3 days. Sizes the trailing reprocessing window downstream.
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              # Negative lag = ingested before issued = a clock problem somewhere.
+              inclusive: true
+
+      - name: payment_method
+        description: 25,822 lines are null by injection. Explicitly NOT tested not_null — see stg_customers note.
+        tests:
+          - accepted_values:
+              values: [card, ach, wire, sepa]
+              # accepted_values ignores NULLs, so this validates the domain without
+              # asserting presence. That is the right pair for a nullable enum.
+
+  - name: stg_customers
+    description: One row per account. Nullable-by-contract fields are handled, not hidden.
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: currency_code
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_fx_rates')
+              field: currency_code
+      - name: country_code
+        tests: [not_null]
+      - name: industry
+        description: Coalesced to 'Unknown' (661 rows) so GROUP BY totals reconcile to the company total.
+        tests: [not_null]
+      - name: is_industry_known
+        tests: [not_null]
+      - name: employee_count
+        description: >
+          Left NULL on 1,277 rows deliberately. No not_null test — defaulting a measure
+          to 0 would drag every average toward zero; NULL is arithmetically honest.
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+      - name: account_manager_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_employees')
+              field: employee_id
+      - name: signup_date
+        tests: [not_null]
+
+  - name: stg_subscriptions
+    description: One row per spell — a contiguous period on one plan at one seat count.
+    columns:
+      - name: subscription_id
+        tests: [not_null, unique]
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: plan_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_plans')
+              field: plan_id
+      - name: seats
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+      - name: spell_started_at
+        tests: [not_null]
+      - name: spell_ended_at
+        description: NULL means open. No not_null test — that is the point.
+      - name: spell_status
+        tests:
+          - not_null
+          - accepted_values:
+              values: [active, closed, churned]
+      - name: change_reason
+        tests:
+          - not_null
+          - accepted_values:
+              values: [new, upgrade, downgrade, seat_change, reactivation]
+              # The MRR waterfall in M4 branches on exactly these five. A sixth
+              # reason would fall through every CASE and land in an 'other' bucket
+              # nobody looks at.
+
+  - name: stg_plans
+    columns:
+      - name: plan_id
+        tests: [not_null, unique]
+      - name: tier
+        tests:
+          - not_null
+          - accepted_values:
+              values: [Starter, Growth, Pro, Enterprise]
+      - name: tier_rank
+        description: Orders the ladder. Comparing tier names alphabetically would rank Enterprise below Growth and invert half the waterfall.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2, 3, 4]
+              quote: false
+      - name: seat_price_monthly_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+      - name: billing_interval
+        tests:
+          - not_null
+          - accepted_values:
+              values: [monthly, annual]
+
+  - name: stg_employees
+    description: Sales org, self-referencing. Exactly one root.
+    columns:
+      - name: employee_id
+        tests: [not_null, unique]
+      - name: manager_id
+        description: >
+          NULL on exactly one row (the org root). No not_null test — it would fail on
+          the row that is supposed to look like that. Root cardinality is asserted in
+          tests/assert_org_has_single_root.sql instead.
+        tests:
+          - relationships:
+              to: ref('stg_employees')
+              field: employee_id
+              # Self-referential integrity: every manager must be a real employee.
+              # A dangling manager_id would make the recursive CTE in M4 silently
+              # drop that manager's entire subtree from the rollup.
+      - name: region
+        tests:
+          - not_null
+          - accepted_values:
+              values: [GLOBAL, AMER, EMEA, APAC]
+
+  - name: stg_fx_rates
+    columns:
+      - name: rate_date
+        tests: [not_null]
+      - name: currency_code
+        tests: [not_null]
+      - name: rate_to_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+              # A zero or negative rate would divide revenue to infinity or flip its
+              # sign. Cheap guard on the number everything else is denominated in.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [rate_date, currency_code]

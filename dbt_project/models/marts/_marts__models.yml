@@ -1,0 +1,234 @@
+version: 2
+
+models:
+
+  - name: fct_revenue
+    description: >
+      **The published contract.** Grain: one row per customer per calendar month, from
+      their signup month to the end of the reporting window.
+
+      Carries two different kinds of money that must not be added together or used to
+      check each other: mrr_usd/arr_usd are a snapshot of contracted run-rate at month
+      end (a commitment, from subscriptions), while recognized_revenue_usd is revenue
+      earned in the month, allocated pro-rata across the calendar months each billing
+      period covers (from invoices). An annual customer commits 12x their MRR but is
+      invoiced once; a customer who churns mid-month has zero closing MRR and a
+      fortnight of recognized revenue. They do not tie out, by design.
+
+      Rows persist after churn with mrr_usd = 0 — that is what makes churn detectable.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [customer_id, date_key]
+          config:
+            severity: error
+
+    columns:
+      - name: revenue_key
+        description: Surrogate key over (customer_id, month).
+        tests: [not_null, unique]
+
+      - name: date_key
+        description: First day of the month. Joins to dim_date.date_key.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+
+      - name: customer_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_key
+
+      - name: plan_key
+        description: NULL on inactive (post-churn) months — there is no plan in force. Not a defect.
+        tests:
+          - relationships:
+              to: ref('dim_product')
+              field: plan_key
+
+      - name: mrr_usd
+        description: Contracted run-rate at month end. Zero for churned/inactive months, never NULL.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+              # Negative MRR is meaningless — a contract cannot bill less than nothing.
+              # Contraction shows as a negative *delta*, not a negative level.
+
+      - name: arr_usd
+        description: mrr_usd * 12. Stored rather than computed in BI so every report agrees.
+        tests: [not_null]
+
+      - name: movement_type
+        description: >
+          How this month's MRR differs from last month's. Classification order matters —
+          exclusive cases (new/reactivation/churn) are evaluated before directional ones
+          (expansion/contraction).
+        tests:
+          - not_null
+          - accepted_values:
+              values: [new, reactivation, expansion, contraction, churn, unchanged, inactive]
+
+      - name: mrr_delta_usd
+        description: mrr_usd - prior_mrr_usd. Negative for contraction and churn.
+        tests: [not_null]
+
+      - name: new_mrr_usd
+        description: Non-zero only when movement_type = 'new'. Sums with the other four components to reconcile the waterfall.
+        tests: [not_null]
+      - name: reactivation_mrr_usd
+        tests: [not_null]
+      - name: expansion_mrr_usd
+        tests: [not_null]
+      - name: contraction_mrr_usd
+        description: Negative by construction.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              max_value: 0
+              inclusive: true
+      - name: churned_mrr_usd
+        description: Negative by construction.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              max_value: 0
+              inclusive: true
+
+      - name: recognized_revenue_usd
+        description: >
+          Earned this month, allocated pro-rata by days across the months each billing
+          period covers. Net of discounts and credits. Excludes tax.
+        tests: [not_null]
+
+      - name: tax_collected_usd
+        description: >
+          Collected on behalf of a tax authority. **Never revenue.** Reported because
+          someone always asks; excluded from every revenue column because including it
+          would inflate ARR by roughly the blended tax rate.
+        tests: [not_null]
+
+      - name: seats
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+
+      - name: is_active
+        tests: [not_null]
+
+  - name: dim_customer
+    description: >
+      One row per account, with the sales org flattened onto it (AE -> manager ->
+      director -> VP).
+
+      **Type 1 — current state only.** This is the biggest modelling limitation in the
+      project and is stated rather than hidden: slicing historical ARR by region applies
+      *today's* region to every past month, so a territory reshuffle silently rewrites
+      last year. Type 2 would fix it; the generator emits no change history to build it
+      from, and inventing a valid_from would be modelling a fact that does not exist.
+      Revenue-by-plan is correct over time (fct_revenue carries plan_key at the month it
+      applied); revenue-by-region is not.
+    columns:
+      - name: customer_key
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: cohort_month
+        description: Fixed at signup, never revised. Cohort retention is meaningless if this moves.
+        tests: [not_null]
+      - name: size_band
+        description: Banded on the dimension, not in a BI measure, so every report agrees what 'Mid-Market' means.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [Unknown, SMB, Mid-Market, Enterprise, Strategic]
+      - name: industry
+        tests: [not_null]
+      - name: sales_region
+        tests:
+          - accepted_values:
+              values: [GLOBAL, AMER, EMEA, APAC]
+      - name: account_manager_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_employees')
+              field: employee_id
+      - name: is_currently_active
+        tests: [not_null]
+      - name: lifetime_spell_count
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+
+  - name: dim_product
+    description: Plan dimension. Eight rows. Exists so reports join to a named tier and an ordered rank instead of parsing plan_id strings.
+    columns:
+      - name: plan_key
+        tests: [not_null, unique]
+      - name: plan_id
+        tests: [not_null, unique]
+      - name: tier
+        tests:
+          - not_null
+          - accepted_values:
+              values: [Starter, Growth, Pro, Enterprise]
+      - name: tier_rank
+        description: The sort order for every tier axis in BI. Without it, tools sort alphabetically and Enterprise lands below Growth.
+        tests: [not_null]
+      - name: seat_price_monthly_usd
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+      - name: is_annual
+        tests: [not_null]
+
+  - name: dim_date
+    description: Daily date spine covering the reporting window. Daily rather than monthly because a date dimension that only holds month starts cannot answer a question about a day.
+    columns:
+      - name: date_key
+        tests: [not_null, unique]
+      - name: calendar_year
+        tests: [not_null]
+      - name: month_start
+        tests: [not_null]
+      - name: fiscal_year
+        description: FY starts 1 Feb. Hardcoded once here rather than re-derived in every BI measure.
+        tests: [not_null]
+      - name: is_month_end
+        tests: [not_null]
+
+  - name: fct_arr_snapshot
+    description: >
+      One row per (dbt run, month) recording total ARR as that run computed it. Append-only.
+
+      Exists so that "a historical month's ARR changed between two runs" is answerable —
+      the thing that actually matters, and which no single-run test can see. A closed
+      month's ARR is a fact; if today's run disagrees with yesterday's about March 2025,
+      a code change moved a closed month.
+
+      `--full-refresh` wipes the history and silences the tolerance test (it passes
+      vacuously with no prior run to compare). That makes full-refresh of this model a
+      deliberate act, not a routine one.
+    columns:
+      - name: snapshot_run_id
+        description: dbt invocation_id. Distinct per run, which is what makes the append work.
+        tests: [not_null]
+      - name: snapshot_at
+        tests: [not_null]
+      - name: date_key
+        tests: [not_null]
+      - name: total_arr_usd
+        tests: [not_null]
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [snapshot_run_id, date_key]
